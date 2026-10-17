@@ -99,7 +99,6 @@ fun FlowChainStudioProApp() {
     var showAddSongSheet by remember { mutableStateOf(false) }
     var importTargetDeckA by remember { mutableStateOf(false) }
 
-    // Hardware MediaCodec Audio Picker (MP3 / M4A / WAV / FLAC)
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -125,7 +124,8 @@ fun FlowChainStudioProApp() {
                         chainedHistory[0] = "00:00 ${importedTrack.title}"
                     } else {
                         trackB = importedTrack
-                        chainedHistory[chainedHistory.lastIndex] = "00:${(trackA.durationSec - config.durationSeconds).toInt()} ${importedTrack.title}"
+                        chainedHistory[chainedHistory.lastIndex] =
+                            "00:${(trackA.durationSec - config.durationSeconds).toInt().coerceAtLeast(0)} ${importedTrack.title}"
                     }
                     liveDualPreview.loadTracks(trackA.uri ?: trackA.localFile, trackB.uri ?: trackB.localFile)
                     Toast.makeText(context, "Decoded ${importedTrack.bpm} BPM (${analysis.durationSec.toInt()}s)", Toast.LENGTH_LONG).show()
@@ -138,7 +138,6 @@ fun FlowChainStudioProApp() {
         }
     }
 
-    // Real-Time Dual ExoPlayer + DSP Scrubber Loop
     LaunchedEffect(isPreviewPlaying, config, stemConfig) {
         if (isPreviewPlaying) {
             liveDualPreview.startSynchronizedPreview(trackA.durationSec, config.durationSeconds)
@@ -171,7 +170,6 @@ fun FlowChainStudioProApp() {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 1. HEADER & HARDWARE DECODER IMPORT BUTTONS
         TopStudioHeaderPro(
             chainedHistory = chainedHistory,
             isDecoding = isDecodingFile,
@@ -185,7 +183,6 @@ fun FlowChainStudioProApp() {
             }
         )
 
-        // 2. CAMELOT HARMONIC KEY COMPATIBILITY BANNER
         val (harmonyText, isHarmonious) = CamelotKeyMatcher.getCompatibilityBadge(trackA.musicalKey, trackB.musicalKey)
         Row(
             modifier = Modifier
@@ -205,7 +202,6 @@ fun FlowChainStudioProApp() {
             Text(harmonyText, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
 
-        // 3. DUAL DECK CARDS
         DualDeckCards(
             trackA = trackA,
             trackB = trackB,
@@ -213,7 +209,6 @@ fun FlowChainStudioProApp() {
             onSwapNextTrack = { showAddSongSheet = true }
         )
 
-        // 4. INTERACTIVE WAVEFORM & LIVE EXOPLAYER PREVIEW
         WaveformTransitionVisualizer(
             trackA = trackA,
             trackB = trackB,
@@ -227,19 +222,16 @@ fun FlowChainStudioProApp() {
             }
         )
 
-        // 5. AI 4-STEM SEPARATION & MASHUP MATRIX
         AiStemSeparationCard(
             stemConfig = stemConfig,
             onStemConfigChange = { stemConfig = it }
         )
 
-        // 6. CROSSFADE, BASS-SWAP & LOOP-ROLL FX PANEL
         TransitionCustomizerPanel(
             config = config,
             onConfigChange = { config = it }
         )
 
-        // 7. MERGE, DOWNLOAD (+ TRACKLIST) & DAISY-CHAIN ACTION BAR
         MergeAndChainActionCard(
             trackA = trackA,
             trackB = trackB,
@@ -319,7 +311,8 @@ fun FlowChainStudioProApp() {
                                         val secs = (newDuration.toInt() % 60).toString().padStart(2, '0')
                                         chainedHistory.add("$mins:$secs ${candidate.title}")
                                     } ?: run {
-                                        chainedHistory[chainedHistory.lastIndex] = "00:${(trackA.durationSec - config.durationSeconds).toInt()} ${candidate.title}"
+                                        chainedHistory[chainedHistory.lastIndex] =
+                                            "00:${(trackA.durationSec - config.durationSeconds).toInt().coerceAtLeast(0)} ${candidate.title}"
                                     }
                                     trackB = candidate
                                     liveDualPreview.loadTracks(trackA.uri ?: trackA.localFile, trackB.uri ?: trackB.localFile)
@@ -478,4 +471,412 @@ fun AiStemSeparationCard(
     }
 }
 
-// Re-include DualDeckCards, WaveformTransitionVisualizer, TransitionCustomizerPanel, and MergeAndChainActionCard from aboveMainActivity.kt
+@Composable
+fun DualDeckCards(
+    trackA: AudioTrackItem,
+    trackB: AudioTrackItem,
+    enableBpmSync: Boolean,
+    onSwapNextTrack: () -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color(0xFF141720))
+                .border(1.dp, Color(0x5500F5D4), RoundedCornerShape(14.dp))
+                .padding(12.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = if (trackA.isChainedCombo) "DECK A • MASTER COMBO" else "DECK A • OUTGOING",
+                    color = Color(0xFF00F5D4),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                if (trackA.isChainedCombo) {
+                    Badge(containerColor = Color(0xFF00F5D4), contentColor = Color.Black) {
+                        Text("${trackA.chainCount}x", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(trackA.title, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(trackA.artist, color = Color(0xFF8A94A6), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(6.dp))
+            Text("${trackA.bpm} BPM • Key ${trackA.musicalKey}", color = Color(0xFF00F5D4), fontSize = 11.sp)
+        }
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .clip(RoundedCornerShape(14.dp))
+                .background(Color(0xFF141720))
+                .border(1.dp, Color(0x55FF2A85), RoundedCornerShape(14.dp))
+                .clickable { onSwapNextTrack() }
+                .padding(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("DECK B • INCOMING", color = Color(0xFFFF2A85), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Text("CHANGE", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(trackB.title, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(trackB.artist, color = Color(0xFF8A94A6), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(6.dp))
+            val syncedBpmText = if (enableBpmSync) "${trackA.bpm} BPM (Synced)" else "${trackB.bpm} BPM"
+            Text("$syncedBpmText • Key ${trackB.musicalKey}", color = Color(0xFFFF2A85), fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+fun WaveformTransitionVisualizer(
+    trackA: AudioTrackItem,
+    trackB: AudioTrackItem,
+    config: TransitionConfig,
+    playhead: Float,
+    isPlaying: Boolean,
+    onTogglePlay: () -> Unit,
+    onScrub: (Float) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFF141720))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "TRANSITION OVERLAP (${config.durationSeconds.toInt()}s) • ${config.curve.label.uppercase()}",
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold
+            )
+            FilledIconButton(
+                onClick = onTogglePlay,
+                colors = IconButtonDefaults.filledIconButtonColors(containerColor = Color(0xFF00F5D4))
+            ) {
+                Icon(
+                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = "Preview Transition",
+                    tint = Color.Black
+                )
+            }
+        }
+
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(150.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(Color(0xFF090B10))
+        ) {
+            val w = size.width
+            val h = size.height
+            val midY = h / 2f
+
+            val zoneStart = w * 0.2f
+            val zoneEnd = w * 0.8f
+            val zoneWidth = zoneEnd - zoneStart
+
+            drawRect(
+                color = Color(0x189B5DE5),
+                topLeft = Offset(zoneStart, 0f),
+                size = Size(zoneWidth, h)
+            )
+
+            val peaksA = trackA.waveformPeaks
+            val barWidth = (w * 0.8f) / peaksA.size
+            peaksA.forEachIndexed { idx, amp ->
+                val x = idx * barWidth
+                val normT = ((x - zoneStart) / zoneWidth).coerceIn(0f, 1f)
+                val fadeA = if (x < zoneStart) 1f else (1f - normT)
+                val barH = amp * (h * 0.42f) * fadeA
+                drawLine(
+                    color = Color(0xFF00F5D4).copy(alpha = 0.75f),
+                    start = Offset(x, midY - barH),
+                    end = Offset(x, midY),
+                    strokeWidth = barWidth * 0.65f
+                )
+            }
+
+            val peaksB = trackB.waveformPeaks
+            peaksB.forEachIndexed { idx, amp ->
+                val x = zoneStart + idx * barWidth
+                if (x <= w) {
+                    val normT = ((x - zoneStart) / zoneWidth).coerceIn(0f, 1f)
+                    val fadeB = if (x > zoneEnd) 1f else normT
+                    val barH = amp * (h * 0.42f) * fadeB
+                    drawLine(
+                        color = Color(0xFFFF2A85).copy(alpha = 0.75f),
+                        start = Offset(x, midY),
+                        end = Offset(x, midY + barH),
+                        strokeWidth = barWidth * 0.65f
+                    )
+                }
+            }
+
+            val pathA = Path()
+            val pathB = Path()
+            val steps = 40
+            for (s in 0..steps) {
+                val t = s / steps.toFloat()
+                val x = zoneStart + t * zoneWidth
+                val (gA, gB) = when (config.curve) {
+                    CrossfadeCurve.LINEAR -> Pair(1f - t, t)
+                    CrossfadeCurve.CONSTANT_POWER -> Pair(cos(t * 1.5708f), sin(t * 1.5708f))
+                    CrossfadeCurve.S_CURVE -> {
+                        val v = t * t * (3f - 2f * t)
+                        Pair(1f - v, v)
+                    }
+                    CrossfadeCurve.HARD_SLAM -> Pair(if (t < 0.85f) 1f else 0f, if (t < 0.85f) t * 0.4f else 1f)
+                }
+                val yA = h - (gA * (h * 0.85f) + h * 0.07f)
+                val yB = h - (gB * (h * 0.85f) + h * 0.07f)
+                if (s == 0) {
+                    pathA.moveTo(x, yA)
+                    pathB.moveTo(x, yB)
+                } else {
+                    pathA.lineTo(x, yA)
+                    pathB.lineTo(x, yB)
+                }
+            }
+            drawPath(pathA, color = Color(0xFF00F5D4), style = Stroke(width = 5f))
+            drawPath(pathB, color = Color(0xFFFF2A85), style = Stroke(width = 5f))
+
+            if (config.enableBassSwap) {
+                val swapX = zoneStart + config.bassSwapRatio * zoneWidth
+                drawLine(
+                    color = Color(0xFFFFBE0B),
+                    start = Offset(swapX, 0f),
+                    end = Offset(swapX, h),
+                    strokeWidth = 3f,
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f))
+                )
+            }
+
+            val playheadX = zoneStart + playhead * zoneWidth
+            drawLine(
+                color = Color.White,
+                start = Offset(playheadX, 0f),
+                end = Offset(playheadX, h),
+                strokeWidth = 4f
+            )
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Scrub:", color = Color(0xFF8A94A6), fontSize = 11.sp)
+            Slider(
+                value = playhead,
+                onValueChange = onScrub,
+                modifier = Modifier.weight(1f)
+            )
+            Text("Bass Swap: ${(config.bassSwapRatio * 100).toInt()}%", color = Color(0xFFFFBE0B), fontSize = 11.sp)
+        }
+    }
+}
+
+@Composable
+fun TransitionCustomizerPanel(
+    config: TransitionConfig,
+    onConfigChange: (TransitionConfig) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFF141720))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Text("CUSTOMIZE TRANSITION ENGINE", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+
+        Column {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Overlap Length", color = Color(0xFFA0AAB8), fontSize = 12.sp)
+                Text("${config.durationSeconds.toInt()} seconds", color = Color(0xFF00F5D4), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+            Slider(
+                value = config.durationSeconds,
+                onValueChange = { onConfigChange(config.copy(durationSeconds = it)) },
+                valueRange = 2f..24f
+            )
+        }
+
+        Text("Volume Curve Shape", color = Color(0xFFA0AAB8), fontSize = 12.sp)
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            CrossfadeCurve.entries.forEach { curve ->
+                FilterChip(
+                    selected = config.curve == curve,
+                    onClick = { onConfigChange(config.copy(curve = curve)) },
+                    label = { Text(curve.label, fontSize = 12.sp) }
+                )
+            }
+        }
+
+        Text("Transition DSP Effect", color = Color(0xFFA0AAB8), fontSize = 12.sp)
+        Row(
+            modifier = Modifier.horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            TransitionFx.entries.forEach { fx ->
+                FilterChip(
+                    selected = config.transitionFx == fx,
+                    onClick = { onConfigChange(config.copy(transitionFx = fx)) },
+                    label = { Text(fx.label, fontSize = 12.sp) }
+                )
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(Modifier.weight(1f)) {
+                Text("Bass-Swap Point (${(config.bassSwapRatio * 100).toInt()}%)", color = Color(0xFFFFBE0B), fontSize = 11.sp)
+                Slider(
+                    value = config.bassSwapRatio,
+                    onValueChange = { onConfigChange(config.copy(bassSwapRatio = it)) },
+                    valueRange = 0.1f..0.9f
+                )
+            }
+            Column(Modifier.weight(1f)) {
+                Text("FX Resonance (${(config.fxIntensity * 100).toInt()}%)", color = Color(0xFFFF2A85), fontSize = 11.sp)
+                Slider(
+                    value = config.fxIntensity,
+                    onValueChange = { onConfigChange(config.copy(fxIntensity = it)) },
+                    valueRange = 0.1f..1.0f
+                )
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = config.enableBassSwap,
+                    onCheckedChange = { onConfigChange(config.copy(enableBassSwap = it)) }
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("Bass Swap", color = Color.White, fontSize = 12.sp)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = config.enableVocalDucking,
+                    onCheckedChange = { onConfigChange(config.copy(enableVocalDucking = it)) }
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("Vocal Duck", color = Color.White, fontSize = 12.sp)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = config.enableBpmSync,
+                    onCheckedChange = { onConfigChange(config.copy(enableBpmSync = it)) }
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("BPM Sync", color = Color.White, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun MergeAndChainActionCard(
+    trackA: AudioTrackItem,
+    trackB: AudioTrackItem,
+    isRendering: Boolean,
+    renderProgress: Float,
+    lastRenderedFile: File?,
+    onCombineAndMerge: () -> Unit,
+    onDownloadMergedFile: () -> Unit,
+    onChainNextSong: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(Color(0xFF1A1F2E))
+            .border(1.dp, Color(0xFF9B5DE5), RoundedCornerShape(16.dp))
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text(
+            text = "EXPORT COMBO OR DAISY-CHAIN NEXT TRACK",
+            color = Color.White,
+            fontWeight = FontWeight.ExtraBold,
+            fontSize = 14.sp
+        )
+        Text(
+            text = "Combine \"${trackA.title}\" + \"${trackB.title}\" into a single seamless audio file with your transition baked in.",
+            color = Color(0xFFA0AAB8),
+            fontSize = 12.sp
+        )
+
+        if (isRendering) {
+            LinearProgressIndicator(
+                progress = { renderProgress },
+                modifier = Modifier.fillMaxWidth(),
+                color = Color(0xFF00F5D4)
+            )
+            Text("Rendering DSP Transition... ${(renderProgress * 100).toInt()}%", color = Color(0xFF00F5D4), fontSize = 12.sp)
+        }
+
+        Button(
+            onClick = onCombineAndMerge,
+            enabled = !isRendering,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00F5D4), contentColor = Color.Black)
+        ) {
+            Icon(Icons.Default.MergeType, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text("1. Combine Songs with Transition", fontWeight = FontWeight.Bold)
+        }
+
+        AnimatedVisibility(visible = lastRenderedFile != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Button(
+                    onClick = onDownloadMergedFile,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF9B5DE5), contentColor = Color.White)
+                ) {
+                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Download Combo", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+
+                Button(
+                    onClick = onChainNextSong,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF2A85), contentColor = Color.White)
+                ) {
+                    Icon(Icons.Default.AddLink, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("+ Chain Next Song", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
