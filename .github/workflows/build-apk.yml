@@ -23,11 +23,13 @@ jobs:
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
-      - name: Setup Gradle 8.10.2 & Build Debug APK
+      - name: Setup Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
-          arguments: assembleDebug --stacktrace
+
+      - name: Build Debug APK
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload Compiled APK to GitHub Artifacts
         uses: actions/upload-artifact@v4
