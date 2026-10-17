@@ -72,7 +72,6 @@ private val MonoGreyDark = Color(0xFF333333)
 
 private const val MAX_SETLIST_TRACKS = 10
 
-// Public enums & state holders so Kotlin compiler never raises visibility clashes
 enum class CanvasTouchMode {
     PLAYHEAD, BASS_SWAP
 }
@@ -81,12 +80,12 @@ enum class DeckTarget {
     DECK_A, DECK_B
 }
 
-enum class LoopRollMode(val label: String) {
-    OFF("OFF"),
-    HALF("1/2 ROLL"),
-    QUARTER("1/4 ROLL"),
-    EIGHTH("1/8 STUTTER"),
-    VINYL_BRAKE("VINYL BRAKE")
+enum class LoopRollMode(val label: String, val code: Int) {
+    OFF("OFF", 0),
+    HALF("1/2 ROLL", 1),
+    QUARTER("1/4 ROLL", 2),
+    EIGHTH("1/8 STUTTER", 3),
+    VINYL_BRAKE("VINYL BRAKE", 4)
 }
 
 data class SetlistTrackNode(
@@ -126,13 +125,13 @@ private fun snapToBeatGrid(timeSec: Float, bpm: Int, enabled: Boolean): Float {
 
 /**
  * Extracts real ID3 Title/Artist via MediaMetadataRetriever and runs a lightweight
- * chroma/energy analysis on the decoded PCM data for Camelot Key + Auto-Gain LUFS matching.
+ * chroma/energy analysis on the decoded FloatArray PCM data for Camelot Key + Auto-Gain LUFS matching.
  */
 private suspend fun analyzeImportedAudioMetadata(
     context: Context,
     uri: Uri,
-    pcmStereo: ShortArray?,
-    waveformPeaks: FloatArray,
+    pcmStereo: FloatArray?,
+    waveformPeaks: List<Float>,
     durationSec: Float
 ): ExtractedAudioMeta = withContext(Dispatchers.Default) {
     var title = ""
@@ -165,7 +164,7 @@ private suspend fun analyzeImportedAudioMetadata(
     if (pcmStereo != null && pcmStereo.isNotEmpty()) {
         var i = 0
         while (i < pcmStereo.size) {
-            val norm = pcmStereo[i] / 32768.0
+            val norm = pcmStereo[i].toDouble()
             sumSq += norm * norm
             count++
             i += sampleStep
@@ -176,7 +175,7 @@ private suspend fun analyzeImportedAudioMetadata(
     val targetDb = -14f
     val autoGainDb = (targetDb - rmsDb).coerceIn(-6f, 6f)
 
-    // Estimate Camelot Key from zero-crossing pitch profile of decoded buffer
+    // Estimate Camelot Key from zero-crossing pitch profile of decoded FloatArray buffer
     val camelotKeys = arrayOf(
         "1A", "2A", "3A", "4A", "5A", "6A", "7A", "8A", "9A", "10A", "11A", "12A",
         "1B", "2B", "3B", "4B", "5B", "6B", "7B", "8B", "9B", "10B", "11B", "12B"
@@ -185,7 +184,7 @@ private suspend fun analyzeImportedAudioMetadata(
         var zeroCrossings = 0
         val limit = min(pcmStereo.size - 2, 88200)
         for (i in 0 until limit step 2) {
-            if ((pcmStereo[i] >= 0 && pcmStereo[i + 2] < 0) || (pcmStereo[i] < 0 && pcmStereo[i + 2] >= 0)) {
+            if ((pcmStereo[i] >= 0f && pcmStereo[i + 2] < 0f) || (pcmStereo[i] < 0f && pcmStereo[i + 2] >= 0f)) {
                 zeroCrossings++
             }
         }
@@ -194,18 +193,24 @@ private suspend fun analyzeImportedAudioMetadata(
         camelotKeys[abs(title.hashCode()) % camelotKeys.size]
     }
 
-    // Auto-detect energetic cue-in and outro drop-off from waveformPeaks
+    // Auto-detect energetic cue-in and outro drop-off from waveformPeaks List<Float>
     var firstEnergeticIdx = 0
     var lastEnergeticIdx = waveformPeaks.lastIndex.coerceAtLeast(0)
     if (waveformPeaks.isNotEmpty()) {
         val peakMax = (waveformPeaks.maxOrNull() ?: 1f).coerceAtLeast(0.1f)
         val threshold = peakMax * 0.45f
-        firstEnergeticIdx = waveformPeaks.indexOfFirst { it >= threshold }.coerceAtLeast(0)
-        lastEnergeticIdx = waveformPeaks.indexOfLast { it >= threshold }.coerceAtLeast(firstEnergeticIdx)
+        val foundFirst = waveformPeaks.indexOfFirst { it >= threshold }
+        val foundLast = waveformPeaks.indexOfLast { it >= threshold }
+        firstEnergeticIdx = if (foundFirst >= 0) foundFirst else 0
+        lastEnergeticIdx = if (foundLast >= firstEnergeticIdx) foundLast else waveformPeaks.lastIndex
     }
     val totalPeaks = waveformPeaks.size.coerceAtLeast(1)
-    val cueInSec = ((firstEnergeticIdx.toFloat() / totalPeaks) * durationSec).coerceIn(0f, (durationSec * 0.25f))
-    val cueOutSec = ((lastEnergeticIdx.toFloat() / totalPeaks) * durationSec).coerceIn(durationSec * 0.55f, (durationSec - 8f).coerceAtLeast(0f))
+    val cueInSec = ((firstEnergeticIdx.toFloat() / totalPeaks) * durationSec)
+        .coerceIn(0f, (durationSec * 0.25f).coerceAtLeast(0f))
+    val maxOutroStart = (durationSec - 8f).coerceAtLeast(0f)
+    val minOutroStart = (durationSec * 0.55f).coerceAtMost(maxOutroStart)
+    val cueOutSec = ((lastEnergeticIdx.toFloat() / totalPeaks) * durationSec)
+        .coerceIn(minOutroStart, maxOutroStart)
 
     ExtractedAudioMeta(
         title = title,
@@ -279,18 +284,17 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
         mutableStateListOf(
             SetlistTrackNode(
                 track = libraryCatalog[0],
-                cueStartASec = (libraryCatalog[0].durationSec - 10f).coerceAtLeast(0f),
+                cueStartASec = (libraryCatalog[0].durationSec - 8f).coerceAtLeast(0f),
                 autoGainDb = 0.4f
             ),
             SetlistTrackNode(
                 track = libraryCatalog[1],
-                cueStartASec = (libraryCatalog[1].durationSec - 10f).coerceAtLeast(0f),
+                cueStartASec = (libraryCatalog[1].durationSec - 8f).coerceAtLeast(0f),
                 autoGainDb = -0.3f
             )
         )
     }
 
-    // Active transition index: pairs setlistNodes[activeIndex] (Deck A) -> setlistNodes[activeIndex + 1] (Deck B)
     var activeTransitionIndex by remember { mutableIntStateOf(0) }
     val safeIndex = activeTransitionIndex.coerceIn(0, (setlistNodes.size - 2).coerceAtLeast(0))
     val nodeA = setlistNodes[safeIndex]
@@ -326,7 +330,6 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
     var addSongModeAppendToSetlist by remember { mutableStateOf(false) }
     var importTargetDeckA by remember { mutableStateOf(false) }
 
-    // Keep cue points clamped when overlap duration changes
     LaunchedEffect(config.durationSeconds, trackA.durationSec, trackB.durationSec) {
         val maxA = (trackA.durationSec - config.durationSeconds).coerceAtLeast(0f)
         if (cueStartASec > maxA) {
@@ -338,7 +341,6 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
         }
     }
 
-    // Reload preview decks whenever active setlist node changes
     LaunchedEffect(safeIndex, trackA.id, trackB.id) {
         liveDualPreview.loadTracks(trackA.uri ?: trackA.localFile, trackB.uri ?: trackB.localFile)
     }
@@ -489,7 +491,6 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
             nodeA = nodeA,
             nodeB = nodeB,
             transitionNumber = safeIndex + 1,
-            totalTransitions = (setlistNodes.size - 1).coerceAtLeast(1),
             enableBpmSync = config.enableBpmSync,
             onImportDeckA = {
                 importTargetDeckA = true
@@ -624,10 +625,19 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
                 scope.launch {
                     isRendering = true
                     val comboTitle = "Pair_${safeIndex + 1}_${System.currentTimeMillis() % 1000}"
+                    val enrichedConfig = config.copy(
+                        cueStartASec = cueStartASec,
+                        cueStartBSec = cueStartBSec,
+                        xyCutoffNormalized = nodeA.xyCutoffNormalized,
+                        loopRollCode = nodeA.loopRollMode.code,
+                        pitchShiftSemitonesB = nodeB.pitchShiftSemitones,
+                        autoGainDbA = nodeA.autoGainDb,
+                        autoGainDbB = nodeB.autoGainDb
+                    )
                     val mergedFile = renderer.renderMergedTrack(
                         trackA = trackA,
                         trackB = trackB,
-                        config = config,
+                        config = enrichedConfig,
                         stemConfig = stemConfig,
                         outputFileName = comboTitle,
                         onProgress = { renderProgress = it }
@@ -642,16 +652,26 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
                 scope.launch {
                     isRendering = true
                     var runningTrack = setlistNodes[0].track
+                    var runningCueStartA = setlistNodes[0].cueStartASec
                     var finalFile: File? = null
                     val totalPairs = (setlistNodes.size - 1).coerceAtLeast(1)
 
                     for (i in 0 until totalPairs) {
                         val currentNode = setlistNodes[i]
                         val nextNode = setlistNodes[i + 1]
+                        val stepConfig = currentNode.transitionConfig.copy(
+                            cueStartASec = runningCueStartA,
+                            cueStartBSec = nextNode.cueStartBSec,
+                            xyCutoffNormalized = currentNode.xyCutoffNormalized,
+                            loopRollCode = currentNode.loopRollMode.code,
+                            pitchShiftSemitonesB = nextNode.pitchShiftSemitones,
+                            autoGainDbA = if (i == 0) currentNode.autoGainDb else 0f,
+                            autoGainDbB = nextNode.autoGainDb
+                        )
                         val stepFile = renderer.renderMergedTrack(
                             trackA = runningTrack,
                             trackB = nextNode.track,
-                            config = currentNode.transitionConfig,
+                            config = stepConfig,
                             stemConfig = currentNode.stemConfig,
                             outputFileName = "Setlist_Step_${i + 1}_${System.currentTimeMillis() % 1000}",
                             onProgress = { subProg ->
@@ -659,15 +679,18 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
                             }
                         )
                         finalFile = stepFile
-                        val combinedDuration = runningTrack.durationSec + nextNode.track.durationSec -
-                            currentNode.transitionConfig.durationSeconds
+                        val tailOfB = (nextNode.track.durationSec - nextNode.cueStartBSec).coerceAtLeast(8f)
+                        val newTotalDur = runningCueStartA + tailOfB
+                        runningCueStartA = (runningCueStartA + (nextNode.cueStartASec - nextNode.cueStartBSec).coerceAtLeast(8f))
+                            .coerceAtMost((newTotalDur - nextNode.transitionConfig.durationSeconds).coerceAtLeast(0f))
+
                         runningTrack = AudioTrackItem(
                             id = "step_${i + 1}",
                             title = "Megamix (${i + 2} Tracks)",
                             artist = "FlowChain Setlist",
                             bpm = nextNode.track.bpm,
                             musicalKey = nextNode.track.musicalKey,
-                            durationSec = combinedDuration.coerceAtLeast(10f),
+                            durationSec = newTotalDur,
                             localFile = stepFile,
                             isChainedCombo = true,
                             chainCount = i + 2
@@ -686,7 +709,6 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
             onDownloadMergedFile = {
                 lastRenderedComboFile?.let { file ->
                     scope.launch {
-                        // Build .CUE Sheet + Tracklist with exact MM:SS offsets
                         var cumulativeSec = 0f
                         val cueBuilder = StringBuilder()
                         cueBuilder.appendLine("PERFORMER \"FLOWCHAIN STUDIO\"")
@@ -700,7 +722,7 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
                             cueBuilder.appendLine("    TITLE \"${node.track.title} (${node.track.bpm} BPM • ${node.track.musicalKey})\"")
                             cueBuilder.appendLine("    PERFORMER \"${node.track.artist}\"")
                             cueBuilder.appendLine("    INDEX 01 $mmSs:00")
-                            cumulativeSec += (node.cueStartASec).coerceAtLeast(8f)
+                            cumulativeSec += (node.cueStartASec - node.cueStartBSec).coerceAtLeast(8f)
                         }
 
                         val savedPath = renderer.exportToPublicDownloads(
@@ -708,7 +730,7 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
                             displayTitle = "FlowChain_Megamix_${setlistNodes.size}Songs",
                             tracklistText = cueBuilder.toString()
                         )
-                        Toast.makeText(context, "Saved WAV + CUE Sheet to $savedPath", Toast.LENGTH_LONG).show()
+                        Toast.makeText(context, "Saved to $savedPath", Toast.LENGTH_LONG).show()
                     }
                 }
             },
@@ -725,7 +747,6 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
         Spacer(modifier = Modifier.height(12.dp))
     }
 
-    // Exact MM:SS Input Dialog
     editingCueDeck?.let { targetDeck ->
         val isDeckA = targetDeck == DeckTarget.DECK_A
         val currentSec = if (isDeckA) cueStartASec else cueStartBSec
@@ -791,7 +812,7 @@ fun FlowChainStudioProApp(modifier: Modifier = Modifier) {
                                             setlistNodes.add(
                                                 SetlistTrackNode(
                                                     track = candidate,
-                                                    cueStartASec = (candidate.durationSec - 10f).coerceAtLeast(0f)
+                                                    cueStartASec = (candidate.durationSec - 8f).coerceAtLeast(0f)
                                                 )
                                             )
                                             activeTransitionIndex = (setlistNodes.size - 2).coerceAtLeast(0)
@@ -926,7 +947,6 @@ fun TopSetlistTimelineHeader(
             )
         }
 
-        // Interactive Non-Destructive Setlist Transition Nodes (1->2, 2->3, ..., up to 10 tracks)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1026,7 +1046,6 @@ fun HarmonyAndPitchBar(
             )
         }
 
-        // Pitch-Lock / Semitone Transpose Row for Deck B
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -1066,7 +1085,6 @@ fun DualDeckCards(
     nodeA: SetlistTrackNode,
     nodeB: SetlistTrackNode,
     transitionNumber: Int,
-    totalTransitions: Int,
     enableBpmSync: Boolean,
     onImportDeckA: () -> Unit,
     onImportDeckB: () -> Unit,
@@ -1301,7 +1319,6 @@ fun CuePointTimingCard(
             )
         }
 
-        // Bar-Based Phrase Length Quick Selector (4, 8, 16, 32 Bars)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -1327,7 +1344,6 @@ fun CuePointTimingCard(
 
         HorizontalDivider(color = MonoBorder, thickness = 1.dp)
 
-        // DECK A CUE ROW
         val maxA = (trackA.durationSec - overlapDurationSec).coerceAtLeast(0f)
         CueTrackRow(
             deckLabel = "DECK A // OUTRO BEGINS AT",
@@ -1342,7 +1358,6 @@ fun CuePointTimingCard(
 
         HorizontalDivider(color = MonoBorder, thickness = 1.dp)
 
-        // DECK B CUE ROW
         val maxB = (trackB.durationSec - overlapDurationSec).coerceAtLeast(0f)
         CueTrackRow(
             deckLabel = "DECK B // INTRO ENTERS AT",
@@ -1753,7 +1768,6 @@ fun WaveformTransitionVisualizer(
                 size = Size(zoneWidth, h)
             )
 
-            // Beatgrid & Bar Tick Marks along top and bottom edges
             val totalBeatsInOverlap = ((config.durationSeconds / (60f / trackA.bpm.coerceAtLeast(60))) / zoomFactor)
                 .roundToInt().coerceIn(4, 64)
             for (b in 0..totalBeatsInOverlap) {
@@ -1795,7 +1809,6 @@ fun WaveformTransitionVisualizer(
                 strokeWidth = 1f
             )
 
-            // Deck A Waveform (Top Half - White, zoomed around playhead)
             val peaksA = trackA.waveformPeaks
             if (peaksA.isNotEmpty()) {
                 val visibleCount = (peaksA.size / zoomFactor).roundToInt().coerceAtLeast(8)
@@ -1817,7 +1830,6 @@ fun WaveformTransitionVisualizer(
                 }
             }
 
-            // Deck B Waveform (Bottom Half - Grey)
             val peaksB = trackB.waveformPeaks
             if (peaksB.isNotEmpty()) {
                 val visibleCount = (peaksB.size / zoomFactor).roundToInt().coerceAtLeast(8)
@@ -1841,7 +1853,6 @@ fun WaveformTransitionVisualizer(
                 }
             }
 
-            // Volume Envelope Curves
             val pathA = Path()
             val pathB = Path()
             val steps = 40
@@ -2008,7 +2019,6 @@ fun XyMorphPadAndRollCard(
             val w = size.width
             val h = size.height
 
-            // 4x4 Technical Grid
             for (i in 1..3) {
                 val gx = w * (i / 4f)
                 val gy = h * (i / 4f)
@@ -2019,7 +2029,6 @@ fun XyMorphPadAndRollCard(
             val cx = cutoffNormalized.coerceIn(0f, 1f) * w
             val cy = (1f - fxResonance.coerceIn(0f, 1f)) * h
 
-            // Crosshair lines
             drawLine(
                 color = MonoGreyMid,
                 start = Offset(cx, 0f),
@@ -2035,7 +2044,6 @@ fun XyMorphPadAndRollCard(
                 pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f))
             )
 
-            // Outer ring + solid node
             drawCircle(
                 color = MonoWhite,
                 radius = 13f,
@@ -2049,7 +2057,6 @@ fun XyMorphPadAndRollCard(
             )
         }
 
-        // Beat-Synced Loop Roll & Vinyl Brake Selector
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(
                 text = "OUTRO BEAT ROLL / VINYL BRAKE",
