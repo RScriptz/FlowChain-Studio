@@ -40,7 +40,14 @@ data class TransitionConfig(
     val transitionFx: TransitionFx = TransitionFx.HIGH_PASS_SWEEP,
     val fxIntensity: Float = 0.75f,
     val outgoingTrimEndSec: Float = 0f,
-    val incomingTrimStartSec: Float = 0f
+    val incomingTrimStartSec: Float = 0f,
+    val cueStartASec: Float = -1f,
+    val cueStartBSec: Float = 0f,
+    val xyCutoffNormalized: Float = 0.5f,
+    val loopRollCode: Int = 0, // 0 = OFF, 1 = 1/2, 2 = 1/4, 3 = 1/8, 4 = VINYL_BRAKE
+    val pitchShiftSemitonesB: Int = 0,
+    val autoGainDbA: Float = 0f,
+    val autoGainDbB: Float = 0f
 )
 
 data class AudioTrackItem(
@@ -105,24 +112,43 @@ class AudioChainRenderer(private val context: Context) {
         onProgress(0.35f)
 
         val framesPerSecond = SAMPLE_RATE * CHANNELS
-        val trimAFrames = (config.outgoingTrimEndSec * framesPerSecond).toInt().coerceAtMost(pcmA.size / 2)
-        val trimBFrames = (config.incomingTrimStartSec * framesPerSecond).toInt().coerceAtMost(pcmB.size / 2)
+        val minRequiredSamples = (framesPerSecond * 2) and -2
 
-        val activeASize = (pcmA.size - trimAFrames).coerceAtLeast(framesPerSecond * 2)
-        val activeBStart = trimBFrames.coerceAtLeast(0)
-        val activeBSize = (pcmB.size - activeBStart).coerceAtLeast(framesPerSecond * 2)
+        val requestedOverlap = ((config.durationSeconds * framesPerSecond).toInt() and -2)
+            .coerceAtLeast(framesPerSecond)
 
-        val overlapSamples = (config.durationSeconds * framesPerSecond).toInt()
+        // Stereo-aligned (even index) cue slicing for Track A & Track B
+        val transitionStartSample: Int
+        val activeASize: Int
+        if (config.cueStartASec >= 0f) {
+            val rawStartA = ((config.cueStartASec * framesPerSecond).toInt() and -2)
+                .coerceIn(0, (pcmA.size - minRequiredSamples).coerceAtLeast(0))
+            val rawEndA = (rawStartA + requestedOverlap).coerceAtMost(pcmA.size) and -2
+            transitionStartSample = rawStartA
+            activeASize = rawEndA.coerceAtLeast(min(pcmA.size and -2, minRequiredSamples))
+        } else {
+            val trimAFrames = ((config.outgoingTrimEndSec * framesPerSecond).toInt() and -2)
+                .coerceAtMost(pcmA.size / 2)
+            activeASize = ((pcmA.size - trimAFrames) and -2).coerceAtLeast(min(pcmA.size and -2, minRequiredSamples))
+            transitionStartSample = (activeASize - requestedOverlap).coerceAtLeast(0) and -2
+        }
+
+        val startSecB = if (config.cueStartBSec > 0f) config.cueStartBSec else config.incomingTrimStartSec
+        val activeBStart = ((startSecB * framesPerSecond).toInt() and -2)
+            .coerceIn(0, (pcmB.size - minRequiredSamples).coerceAtLeast(0))
+        val activeBSize = ((pcmB.size - activeBStart) and -2).coerceAtLeast(minRequiredSamples)
+
+        val overlapSamples = ((activeASize - transitionStartSample) and -2)
             .coerceIn(framesPerSecond, min(activeASize, activeBSize))
-
-        val transitionStartSample = activeASize - overlapSamples
 
         // Separate the overlap window into 4 stems if Stem Mashup Mode is enabled
         val stemsA: SeparatedStemsPcm?
         val stemsB: SeparatedStemsPcm?
         if (stemConfig.enableStemMashupMode) {
-            val sliceA = pcmA.copyOfRange(transitionStartSample, activeASize)
-            val sliceB = pcmB.copyOfRange(activeBStart, (activeBStart + overlapSamples).coerceAtMost(pcmB.size))
+            val safeEndA = (transitionStartSample + overlapSamples).coerceAtMost(pcmA.size)
+            val safeEndB = (activeBStart + overlapSamples).coerceAtMost(pcmB.size)
+            val sliceA = pcmA.copyOfRange(transitionStartSample, safeEndA)
+            val sliceB = pcmB.copyOfRange(activeBStart, safeEndB)
             stemsA = stemSeparator.separateIntoFourStems(sliceA) { p -> onProgress(0.35f + p * 0.15f) }
             stemsB = stemSeparator.separateIntoFourStems(sliceB) { p -> onProgress(0.50f + p * 0.15f) }
         } else {
@@ -130,7 +156,14 @@ class AudioChainRenderer(private val context: Context) {
             stemsB = null
         }
 
-        val totalOutputSamples = activeASize + activeBSize - overlapSamples
+        // Linear Auto-Gain multipliers from LUFS / RMS dB offsets
+        val linearGainA = 10f.pow(config.autoGainDbA / 20f).coerceIn(0.35f, 2.2f)
+        val linearGainB = 10f.pow(config.autoGainDbB / 20f).coerceIn(0.35f, 2.2f)
+
+        // Semitone pitch-shift ratio for Deck B
+        val pitchRateB = 2.0.pow(config.pitchShiftSemitonesB / 12.0).toFloat().coerceIn(0.7f, 1.45f)
+
+        val totalOutputSamples = (transitionStartSample + activeBSize) and -2
         val outputPcm = ShortArray(totalOutputSamples)
 
         var lpStateAL = 0f
@@ -138,13 +171,19 @@ class AudioChainRenderer(private val context: Context) {
         var lpStateBL = 0f
         var lpStateBR = 0f
 
-        val delayBufferSize = (SAMPLE_RATE * 0.375f * CHANNELS).toInt()
+        var xyLpAL = 0f
+        var xyLpAR = 0f
+
+        val delayBufferSize = ((SAMPLE_RATE * 0.375f * CHANNELS).toInt() and -2).coerceAtLeast(4096)
         val echoBuffer = FloatArray(delayBufferSize)
         var echoIndex = 0
 
-        // Beat-repeat loop roll buffer (1/4 beat buffer at Track A's BPM)
-        val quarterBeatSamples = (((60f / trackA.bpm.coerceAtLeast(80)) * 0.25f) * framesPerSecond).toInt()
-            .coerceAtLeast(2048) and -2
+        // Beat-repeat loop roll window (1/4 beat buffer at Track A's BPM)
+        val oneBeatSamples = (((60f / trackA.bpm.coerceAtLeast(70)) * framesPerSecond).toInt() and -2)
+            .coerceAtLeast(4096)
+        val quarterBeatSamples = (oneBeatSamples / 4) and -2
+
+        var vinylReadCursorA = 0.0
 
         for (i in 0 until totalOutputSamples step 2) {
             val sampleRightIdx = i + 1
@@ -154,12 +193,15 @@ class AudioChainRenderer(private val context: Context) {
             val outR: Float
 
             if (i < transitionStartSample) {
-                outL = pcmA[i]
-                outR = pcmA[sampleRightIdx]
-            } else if (i < activeASize) {
+                outL = pcmA.getOrElse(i) { 0f } * linearGainA
+                outR = pcmA.getOrElse(sampleRightIdx) { 0f } * linearGainA
+            } else if (i < transitionStartSample + overlapSamples) {
                 val overlapOffset = i - transitionStartSample
                 val progress = (overlapOffset.toFloat() / overlapSamples.toFloat()).coerceIn(0f, 1f)
-                val bIdxL = activeBStart + overlapOffset
+
+                // Pitch-aware stereo frame index for Deck B
+                val pitchedOffsetFrames = ((overlapOffset / 2) * pitchRateB).toInt() * 2
+                val bIdxL = activeBStart + pitchedOffsetFrames
                 val bIdxR = bIdxL + 1
 
                 var sampleAL: Float
@@ -167,42 +209,63 @@ class AudioChainRenderer(private val context: Context) {
                 var sampleBL: Float
                 var sampleBR: Float
 
-                if (stemsA != null && stemsB != null && overlapOffset + 1 < stemsA.vocals.size && overlapOffset + 1 < stemsB.vocals.size) {
-                    // INDEPENDENT 4-STEM MASHUP MIXING
-                    // Outgoing vocals stay strong early, outgoing drums/bass fade faster
+                if (stemsA != null && stemsB != null &&
+                    overlapOffset + 1 < stemsA.vocals.size &&
+                    overlapOffset + 1 < stemsB.vocals.size
+                ) {
                     val vocalFadeA = (1f - progress.pow(1.6f)) * stemConfig.outgoingVocalLevel
                     val drumFadeA = (1f - progress) * stemConfig.outgoingDrumsLevel
                     val bassFadeA = (if (progress < config.bassSwapRatio) 1f else 0.15f) * stemConfig.outgoingBassLevel
                     val melFadeA = (1f - progress) * stemConfig.outgoingMelodyLevel
 
                     sampleAL = stemsA.vocals[overlapOffset] * vocalFadeA +
-                            stemsA.drums[overlapOffset] * drumFadeA +
-                            stemsA.bass[overlapOffset] * bassFadeA +
-                            stemsA.melody[overlapOffset] * melFadeA
+                        stemsA.drums[overlapOffset] * drumFadeA +
+                        stemsA.bass[overlapOffset] * bassFadeA +
+                        stemsA.melody[overlapOffset] * melFadeA
                     sampleAR = stemsA.vocals[overlapOffset + 1] * vocalFadeA +
-                            stemsA.drums[overlapOffset + 1] * drumFadeA +
-                            stemsA.bass[overlapOffset + 1] * bassFadeA +
-                            stemsA.melody[overlapOffset + 1] * melFadeA
+                        stemsA.drums[overlapOffset + 1] * drumFadeA +
+                        stemsA.bass[overlapOffset + 1] * bassFadeA +
+                        stemsA.melody[overlapOffset + 1] * melFadeA
 
-                    // Incoming drums & bass enter immediately while incoming vocals wait slightly to avoid vocal collision
                     val vocalFadeB = progress.pow(1.8f) * stemConfig.incomingVocalLevel
                     val drumFadeB = sqrt(progress) * stemConfig.incomingDrumsLevel
                     val bassFadeB = (if (progress >= config.bassSwapRatio) 1f else 0.2f) * stemConfig.incomingBassLevel
                     val melFadeB = progress * stemConfig.incomingMelodyLevel
 
                     sampleBL = stemsB.vocals[overlapOffset] * vocalFadeB +
-                            stemsB.drums[overlapOffset] * drumFadeB +
-                            stemsB.bass[overlapOffset] * bassFadeB +
-                            stemsB.melody[overlapOffset] * melFadeB
+                        stemsB.drums[overlapOffset] * drumFadeB +
+                        stemsB.bass[overlapOffset] * bassFadeB +
+                        stemsB.melody[overlapOffset] * melFadeB
                     sampleBR = stemsB.vocals[overlapOffset + 1] * vocalFadeB +
-                            stemsB.drums[overlapOffset + 1] * drumFadeB +
-                            stemsB.bass[overlapOffset + 1] * bassFadeB +
-                            stemsB.melody[overlapOffset + 1] * melFadeB
+                        stemsB.drums[overlapOffset + 1] * drumFadeB +
+                        stemsB.bass[overlapOffset + 1] * bassFadeB +
+                        stemsB.melody[overlapOffset + 1] * melFadeB
                 } else {
-                    sampleAL = pcmA[i]
-                    sampleAR = pcmA[sampleRightIdx]
-                    sampleBL = if (bIdxL < pcmB.size) pcmB[bIdxL] else 0f
-                    sampleBR = if (bIdxR < pcmB.size) pcmB[bIdxR] else 0f
+                    sampleAL = pcmA.getOrElse(i) { 0f }
+                    sampleAR = pcmA.getOrElse(sampleRightIdx) { 0f }
+                    sampleBL = pcmB.getOrElse(bIdxL) { 0f }
+                    sampleBR = pcmB.getOrElse(bIdxR) { 0f }
+                }
+
+                // Apply explicit LoopRollMode / Vinyl Brake selected from the 2D XY Pad Card
+                if (config.loopRollCode in 1..3 && progress > 0.5f) {
+                    val rollWindow = when (config.loopRollCode) {
+                        1 -> (oneBeatSamples / 2) and -2
+                        2 -> quarterBeatSamples
+                        else -> (quarterBeatSamples / 2).coerceAtLeast(1024) and -2
+                    }
+                    val rollOrigin = (transitionStartSample + (overlapSamples / 2)) and -2
+                    val rollIdx = (rollOrigin + (overlapOffset % rollWindow)).coerceIn(0, (pcmA.size - 2).coerceAtLeast(0))
+                    sampleAL = pcmA.getOrElse(rollIdx) { sampleAL }
+                    sampleAR = pcmA.getOrElse(rollIdx + 1) { sampleAR }
+                } else if (config.loopRollCode == 4 && progress > 0.65f) {
+                    val brakeProgress = ((progress - 0.65f) / 0.35f).coerceIn(0f, 1f)
+                    val speedFactor = (1.0 - brakeProgress.toDouble().pow(1.8)).coerceAtLeast(0.02)
+                    vinylReadCursorA += speedFactor * 2.0
+                    val brakeOrigin = (transitionStartSample + (overlapSamples * 0.65f).toInt()) and -2
+                    val readIdx = (brakeOrigin + (vinylReadCursorA.toInt() and -2)).coerceIn(0, (pcmA.size - 2).coerceAtLeast(0))
+                    sampleAL = pcmA.getOrElse(readIdx) { 0f } * (1f - brakeProgress * 0.5f)
+                    sampleAR = pcmA.getOrElse(readIdx + 1) { 0f } * (1f - brakeProgress * 0.5f)
                 }
 
                 val (gainA, gainB) = computeGains(progress, config.curve)
@@ -220,6 +283,23 @@ class AudioChainRenderer(private val context: Context) {
                     } else {
                         sampleAL -= lpStateAL * 0.9f
                         sampleAR -= lpStateAR * 0.9f
+                    }
+                }
+
+                // 2D XY Touch Pad Filter Sweep (Left of center = Low-Pass, Right of center = High-Pass)
+                val xyDeviation = config.xyCutoffNormalized - 0.5f
+                if (abs(xyDeviation) > 0.06f) {
+                    val xyAlpha = (0.015f + 0.25f * config.xyCutoffNormalized.pow(2f)).coerceIn(0.01f, 0.45f)
+                    xyLpAL += xyAlpha * (sampleAL - xyLpAL)
+                    xyLpAR += xyAlpha * (sampleAR - xyLpAR)
+                    if (xyDeviation < 0f) {
+                        val lpMix = ((-xyDeviation * 2f) * config.fxIntensity).coerceIn(0f, 0.95f)
+                        sampleAL = sampleAL * (1f - lpMix) + xyLpAL * lpMix
+                        sampleAR = sampleAR * (1f - lpMix) + xyLpAR * lpMix
+                    } else {
+                        val hpMix = ((xyDeviation * 2f) * config.fxIntensity).coerceIn(0f, 0.95f)
+                        sampleAL -= xyLpAL * hpMix
+                        sampleAR -= xyLpAR * hpMix
                     }
                 }
 
@@ -245,14 +325,13 @@ class AudioChainRenderer(private val context: Context) {
                         sampleAR += delayedR * progress * 0.7f
                     }
                     TransitionFx.LOOP_ROLL_STUTTER -> {
-                        // Accelerating 1/4 -> 1/8 -> 1/16 beat stutter roll in the final 40% of the transition
                         if (progress > 0.6f) {
                             val subDiv = if (progress > 0.85f) 4 else if (progress > 0.72f) 2 else 1
                             val loopWindow = (quarterBeatSamples / subDiv).coerceAtLeast(512) and -2
                             val stutterIdx = (transitionStartSample + (overlapOffset % loopWindow))
-                                .coerceIn(0, pcmA.size - 2)
-                            sampleAL = pcmA[stutterIdx]
-                            sampleAR = pcmA[stutterIdx + 1]
+                                .coerceIn(0, (pcmA.size - 2).coerceAtLeast(0))
+                            sampleAL = pcmA.getOrElse(stutterIdx) { sampleAL }
+                            sampleAR = pcmA.getOrElse(stutterIdx + 1) { sampleAR }
                         }
                     }
                     TransitionFx.VINYL_BRAKE -> {
@@ -269,17 +348,23 @@ class AudioChainRenderer(private val context: Context) {
                     1f - (0.15f * sin(progress * Math.PI.toFloat()))
                 } else 1f
 
-                outL = ((sampleAL * gainA * midDip) + (sampleBL * gainB)).coerceIn(-1f, 1f)
-                outR = ((sampleAR * gainA * midDip) + (sampleBR * gainB)).coerceIn(-1f, 1f)
+                val mixedL = (sampleAL * linearGainA * gainA * midDip) + (sampleBL * linearGainB * gainB)
+                val mixedR = (sampleAR * linearGainA * gainA * midDip) + (sampleBR * linearGainB * gainB)
+
+                // Soft-saturation studio limiter to prevent digital clipping
+                outL = tanh(mixedL * 1.05f).coerceIn(-1f, 1f)
+                outR = tanh(mixedR * 1.05f).coerceIn(-1f, 1f)
 
                 if (overlapOffset % 44100 == 0) {
                     onProgress(0.65f + 0.30f * progress)
                 }
             } else {
-                val bIdxL = activeBStart + (i - transitionStartSample)
+                val postOverlapOffset = i - transitionStartSample
+                val pitchedOffsetFrames = ((postOverlapOffset / 2) * pitchRateB).toInt() * 2
+                val bIdxL = activeBStart + pitchedOffsetFrames
                 val bIdxR = bIdxL + 1
-                outL = if (bIdxL < pcmB.size) pcmB[bIdxL] else 0f
-                outR = if (bIdxR < pcmB.size) pcmB[bIdxR] else 0f
+                outL = (pcmB.getOrElse(bIdxL) { 0f } * linearGainB).coerceIn(-1f, 1f)
+                outR = (pcmB.getOrElse(bIdxR) { 0f } * linearGainB).coerceIn(-1f, 1f)
             }
 
             outputPcm[i] = (outL * 32767f).toInt().coerceIn(-32768, 32767).toShort()
@@ -298,7 +383,7 @@ class AudioChainRenderer(private val context: Context) {
         tracklistText: String
     ): String = withContext(Dispatchers.IO) {
         val fileName = "${displayTitle.replace(" ", "_")}.wav"
-        val cueFileName = "${displayTitle.replace(" ", "_")}_Tracklist.txt"
+        val cueFileName = "${displayTitle.replace(" ", "_")}.cue"
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val resolver = context.contentResolver
@@ -318,7 +403,6 @@ class AudioChainRenderer(private val context: Context) {
             audioValues.put(MediaStore.Downloads.IS_PENDING, 0)
             resolver.update(uri, audioValues, null, null)
 
-            // Also save the timestamped Tracklist file for YouTube/Mixcloud
             val txtValues = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, cueFileName)
                 put(MediaStore.Downloads.MIME_TYPE, "text/plain")
@@ -327,7 +411,7 @@ class AudioChainRenderer(private val context: Context) {
             resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, txtValues)?.let { txtUri ->
                 resolver.openOutputStream(txtUri)?.use { it.write(tracklistText.toByteArray()) }
             }
-            "Downloads/FlowChain/$fileName (+ Tracklist.txt)"
+            "Downloads/FlowChain/$fileName (+ $cueFileName)"
         } else {
             val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "FlowChain")
             dir.mkdirs()
@@ -358,17 +442,14 @@ class AudioChainRenderer(private val context: Context) {
     }
 
     private suspend fun loadPcmFromTrack(track: AudioTrackItem, isTrackA: Boolean): FloatArray {
-        // 1. Use cached decoded PCM if already decoded from phone storage
         track.decodedPcmCache?.let { return it }
 
-        // 2. If chained WAV file on disk, read directly
         track.localFile?.let { file ->
             if (file.exists() && file.extension.equals("wav", ignoreCase = true)) {
                 return readWavFileToFloatArray(file)
             }
         }
 
-        // 3. If local phone MP3/M4A/FLAC Uri is attached, decode via hardware MediaCodec!
         track.uri?.let { uri ->
             return try {
                 codecDecoder.decodeAudioUri(uri).pcmStereo44k
@@ -377,13 +458,12 @@ class AudioChainRenderer(private val context: Context) {
             }
         }
 
-        // 4. Fallback built-in synthesizer loop so the app works immediately on first launch
         return synthesizeDemoBeat(track, isTrackA)
     }
 
     private fun synthesizeDemoBeat(track: AudioTrackItem, isTrackA: Boolean): FloatArray {
         val durationSec = track.durationSec.coerceIn(12f, 30f)
-        val totalSamples = (durationSec * SAMPLE_RATE * CHANNELS).toInt()
+        val totalSamples = (durationSec * SAMPLE_RATE * CHANNELS).toInt() and -2
         val buffer = FloatArray(totalSamples)
         val beatPeriodSec = 60f / track.bpm.toFloat()
         val baseFreq = if (isTrackA) 110f else 146.83f
